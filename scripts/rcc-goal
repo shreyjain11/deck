@@ -1,0 +1,95 @@
+#!/usr/bin/env bash
+# rcc-goal — create goals/<session>.md and start the autonomous loop
+set -u
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/rcc-common.sh"
+
+usage() {
+  cat <<EOF
+rcc-goal — assign a goal to a session and start its autonomous loop
+
+USAGE:
+  rcc-goal <session> "<goal>" "<completion-criteria>" ["<milestones>"] [--no-loop]
+
+  <completion-criteria>  objectively verifiable checks, separated by ';'
+                         e.g. "npm test passes; build succeeds"
+  <milestones>           optional, ';'-separated; each reached milestone
+                         triggers a Fable review. Defaults to one milestone.
+  --no-loop              create the goal file but do NOT start the loop
+                         (used for dry runs / tests)
+
+Starts rcc-loop in the background via nohup so it survives disconnects.
+The loop PID is written to .state/<session>.pid; stop it with 'rcc-stop'.
+EOF
+}
+
+[ $# -ge 1 ] || { usage; exit 2; }
+case "$1" in -h|--help) usage; exit 0;; esac
+[ $# -ge 3 ] || die "need <session> <goal> <completion-criteria>"
+
+SESSION="$1"; GOAL="$2"; CRITERIA="$3"; shift 3
+MILESTONES=""
+NOLOOP=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --no-loop) NOLOOP=1;;
+    *) MILESTONES="$1";;
+  esac
+  shift
+done
+[ -n "$MILESTONES" ] || MILESTONES="Goal fully satisfied"
+
+require_mux || exit 127
+mux_has_session "$SESSION" || die "no such tmux session: $SESSION (start a worker first)"
+
+GF="$RCC_GOALS/$SESSION.md"
+if [ -f "$GF" ]; then
+  st="$(goal_status "$GF")"
+  case "$st" in
+    active|milestone-review) die "goal for '$SESSION' is already $st — rcc-stop it first";;
+  esac
+fi
+
+# split a ';'/newline-delimited string into "- [ ] item" lines.
+# The trailing '\n' from printf ensures `read` sees the final item.
+render_boxes() {
+  printf '%s\n' "$1" | tr ';' '\n' | while IFS= read -r item; do
+    item="$(printf '%s' "$item" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')"
+    [ -n "$item" ] && printf -- '- [ ] %s\n' "$item"
+  done
+}
+
+{
+  echo "# Goal: $GOAL"
+  echo "Session: $SESSION"
+  echo "Started: $(rcc_ts)"
+  echo "Status: active"
+  echo ""
+  echo "## Completion criteria (evaluator checks these — must be OBJECTIVELY verifiable)"
+  render_boxes "$CRITERIA"
+  echo ""
+  echo "## Milestones"
+  render_boxes "$MILESTONES"
+  echo ""
+  echo "## Iteration log"
+  echo "| # | timestamp | action summary | evaluator verdict |"
+  echo "|---|-----------|----------------|-------------------|"
+} > "$GF"
+
+# fresh log header
+rcc_log "$SESSION" "GOAL created: $(printf '%s' "$GOAL" | cut -c1-60)"
+echo "created $GF"
+
+"$RCC_SCRIPTS/rcc-list" --no-refresh >/dev/null 2>&1 || true
+
+if [ "$NOLOOP" -eq 1 ]; then
+  echo "(--no-loop) goal created; loop NOT started."
+  exit 0
+fi
+
+# ---- launch the loop detached so it survives disconnects --------------------
+LOG="$RCC_LOGS/$SESSION.loop.out"
+nohup "$RCC_SCRIPTS/rcc-loop" "$SESSION" >> "$LOG" 2>&1 &
+pid=$!
+echo "$pid" > "$RCC_STATE/$SESSION.pid"
+rcc_log "$SESSION" "LOOP started pid=$pid"
+echo "loop started (pid $pid) — tail $LOG or run 'rcc-status'"

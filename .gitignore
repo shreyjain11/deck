@@ -1,0 +1,28 @@
+# ─── SECRETS — never commit ───────────────────────────────
+# (.ntfy_topic = private push topic, .ts_ip = Tailscale IP,
+#  .twilio.json / .imessage_to = optional alert credentials)
+.ntfy_topic
+.ts_ip
+.twilio.json
+.imessage_to
+
+# ─── machine-specific / generated state ───────────────────
+# .state/ holds deck_index.json (lists all your project paths);
+# keepawake.conf regenerates with defaults; SESSIONS.md is generated.
+.state/
+keepawake.conf
+SESSIONS.md
+
+# ─── personal content (keep the dirs, drop the contents) ──
+logs/*
+!logs/.gitkeep
+goals/*.md
+reviews/*.md
+!goals/.gitkeep
+!reviews/.gitkeep
+
+# ─── cruft ────────────────────────────────────────────────
+__pycache__/
+*.pyc
+.claude/
+.DS_Store

@@ -1,0 +1,256 @@
+#!/usr/bin/env bash
+# rcc-loop — the autonomous goal loop for one session. Safe to nohup.
+#
+# Each iteration: read pane -> Haiku evaluator -> branch:
+#   goal_done+confident  -> final Fable review   (only PASS marks done)
+#   milestone_done       -> milestone Fable review (PASS advances)
+#   else                 -> send next_instruction to worker, sleep
+# Guards: RCC_MAX_ITERS, RCC_MAX_FAILS consecutive evaluator failures,
+# stall detection (RCC_STALL_READS identical reads -> nudge once, then flag).
+set -u
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/rcc-common.sh"
+
+usage() {
+  cat <<EOF
+rcc-loop — run the autonomous goal loop for a session (usually launched by rcc-goal)
+
+USAGE:
+  rcc-loop <session>
+
+Reads goals/<session>.md. Honors RCC_MAX_ITERS (${RCC_MAX_ITERS}),
+RCC_MAX_FAILS (${RCC_MAX_FAILS}), RCC_SLEEP (${RCC_SLEEP}s), RCC_READ_LINES (${RCC_READ_LINES}).
+Set RCC_MAX_ITERS=1 for a single dry-run iteration.
+EOF
+}
+
+[ $# -ge 1 ] || { usage; exit 2; }
+case "$1" in -h|--help) usage; exit 0;; esac
+
+SESSION="$1"
+GF="$RCC_GOALS/$SESSION.md"
+[ -f "$GF" ] || die "no goal file: $GF (run rcc-goal first)"
+export RCC_COST_SESSION="$SESSION"
+
+require_mux || exit 127
+
+# ---- helpers ----------------------------------------------------------------
+
+# append a row to the goal file's iteration table (which is the last section)
+append_iter_row() { # <n> <summary> <verdict>
+  local n="$1" summ="$2" verd="$3"
+  summ="$(printf '%s' "$summ" | tr '|\n' ' ' | cut -c1-60)"
+  verd="$(printf '%s' "$verd" | tr '|\n' ' ' | cut -c1-30)"
+  printf '| %s | %s | %s | %s |\n' "$n" "$(rcc_ts)" "$summ" "$verd" >> "$GF"
+}
+
+# gather a token-bounded git diff for the worker's cwd (diff only, never files)
+gather_diff() {
+  local cwd; cwd="$(mux_pane_path "$SESSION")"
+  [ -n "$cwd" ] && [ -d "$cwd" ] || { echo "(worker cwd unknown)"; return; }
+  if ! git -C "$cwd" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    echo "(worker cwd is not a git repo: $cwd)"; return
+  fi
+  echo "### diff --stat"; git -C "$cwd" diff --stat 2>/dev/null | head -40
+  echo "### diff (truncated to 400 lines)"
+  git -C "$cwd" diff 2>/dev/null | head -400
+}
+
+# Haiku writes a <=10-line progress summary (keeps raw transcript away from Fable)
+progress_summary() { # <recent_output>
+  local out="$1"
+  rcc_claude "$RCC_MODEL_EVAL" \
+"Summarize this Claude Code worker's progress in AT MOST 10 terse lines. \
+No preamble. Goal: $(goal_title "$GF")
+
+--- recent pane output ---
+$out"
+}
+
+# Fable milestone/final review. MUST be called in the current shell (not $(...))
+# so it can export REVIEW_VERDICT / REVIEW_FEEDBACK / REVIEW_FILE to the caller.
+run_review() { # <kind: milestone|final> <label> <recent_output>
+  local kind="$1" label="$2" out="$3" diff summ prompt raw file
+  diff="$(gather_diff)"
+  summ="$(progress_summary "$out")"
+  prompt="You are a principal engineer doing a $kind review. Be strict and terse.
+Reply with the FIRST line exactly 'VERDICT: PASS' or 'VERDICT: FAIL', then at
+most 8 lines of specific, actionable feedback. PASS only if the work genuinely
+meets the criteria below — do not accept the worker's own claims.
+
+## Goal file
+$(cat "$GF")
+
+## Progress summary
+$summ
+
+## Git diff (changes only)
+$diff"
+  raw="$(rcc_claude "$RCC_MODEL_REVIEW" "$prompt")"
+  if printf '%s' "$raw" | head -1 | grep -qi 'PASS'; then
+    REVIEW_VERDICT="PASS"
+  else
+    REVIEW_VERDICT="FAIL"
+  fi
+  REVIEW_FEEDBACK="$(printf '%s' "$raw" | sed -n '2,9p')"
+  file="$RCC_REVIEWS/$SESSION-$label.md"
+  {
+    echo "# $kind review — $SESSION — $label"
+    echo "_$(rcc_ts) · model: ${RCC_MODEL_REVIEW}_"
+    echo ""
+    echo "**Verdict: $REVIEW_VERDICT**"
+    echo ""
+    echo "## Feedback"
+    printf '%s\n' "$raw"
+    echo ""
+    echo "## Progress summary (Haiku)"
+    printf '%s\n' "$summ"
+  } > "$file"
+  REVIEW_FILE="$file"
+}
+
+# terminal state helper
+finish() { # <status> <log-msg>
+  goal_set_status "$GF" "$1"
+  rcc_log "$SESSION" "$2"
+  {
+    echo ""
+    echo "## Final summary ($1)"
+    echo "- Ended: $(rcc_ts)"
+    echo "- Iterations: $iter"
+    echo "- $2"
+    echo "- Estimated spend: $(rcc_cost_total "$SESSION")"
+  } >> "$GF"
+  echo "STATUS: $1 — $2"
+  rm -f "$RCC_STATE/$SESSION.pid" 2>/dev/null || true
+}
+
+# ---- main loop --------------------------------------------------------------
+goal_set_status "$GF" "active"
+rcc_log "$SESSION" "LOOP begin (max_iters=$RCC_MAX_ITERS sleep=${RCC_SLEEP}s)"
+
+iter=0
+fails=0
+stall_count=0
+nudged=0
+last_hash=""
+mcount=0   # milestone review counter (for filenames)
+
+while [ "$iter" -lt "$RCC_MAX_ITERS" ]; do
+  iter=$((iter + 1))
+
+  if ! mux_has_session "$SESSION"; then
+    append_iter_row "$iter" "target session vanished" "error"
+    finish failed "target session '$SESSION' no longer exists"
+    exit 1
+  fi
+
+  out="$(mux_capture "$SESSION" "$RCC_READ_LINES")"
+
+  # ---- stall detection ----
+  h="$(printf '%s' "$out" | rcc_hash)"
+  if [ "$h" = "$last_hash" ]; then
+    stall_count=$((stall_count + 1))
+  else
+    stall_count=0
+  fi
+  last_hash="$h"
+  if [ "$stall_count" -ge "$RCC_STALL_READS" ]; then
+    if [ "$nudged" -eq 0 ]; then
+      mux_send "$SESSION" "Are you still working? Briefly state current status and continue toward the goal."
+      rcc_log "$SESSION" "STALL nudge (unchanged x$stall_count)"
+      append_iter_row "$iter" "stalled — nudged worker" "stall"
+      nudged=1; stall_count=0
+      sleep "$RCC_SLEEP"; continue
+    else
+      fails=$((fails + 1))
+      rcc_log "$SESSION" "STALL persists after nudge (fail $fails/$RCC_MAX_FAILS)"
+      append_iter_row "$iter" "still stalled after nudge" "stall-fail"
+      [ "$fails" -ge "$RCC_MAX_FAILS" ] && { finish failed "worker stalled: no progress after nudge"; exit 1; }
+      sleep "$RCC_SLEEP"; continue
+    fi
+  fi
+
+  # ---- evaluate (Haiku, strict JSON) ----
+  eval_prompt="You are an automated evaluator. Given the GOAL FILE and the worker's
+RECENT OUTPUT, decide progress. Reply with ONLY minified JSON (no markdown, no prose):
+{\"milestone_done\":bool,\"goal_done\":bool,\"next_instruction\":\"one concrete next step for the worker\",\"confidence\":0..1}
+Judge completion strictly by the objectively-verifiable criteria; never trust the
+worker's self-claims. Keep next_instruction under 200 chars.
+
+## GOAL FILE
+$(cat "$GF")
+
+## RECENT OUTPUT (last $RCC_READ_LINES lines)
+$out"
+
+  raw="$(rcc_claude "$RCC_MODEL_EVAL" "$eval_prompt")" || raw=""
+  js="$(json_clean "$raw")"
+  msd="$(json_field milestone_done "$js")"
+  gd="$(json_field goal_done "$js")"
+  nexti="$(json_field next_instruction "$js")"
+  conf="$(json_field confidence "$js")"
+
+  if [ -z "$js" ] || { [ -z "$msd" ] && [ -z "$gd" ]; }; then
+    fails=$((fails + 1))
+    rcc_log "$SESSION" "EVAL unparseable (fail $fails/$RCC_MAX_FAILS)"
+    append_iter_row "$iter" "evaluator returned no usable JSON" "eval-fail"
+    [ "$fails" -ge "$RCC_MAX_FAILS" ] && { finish failed "evaluator failed $fails times consecutively"; exit 1; }
+    sleep "$RCC_SLEEP"; continue
+  fi
+  fails=0   # a usable verdict resets the failure streak
+
+  # confidence gate (float compare via awk; missing conf treated as 0)
+  hi_conf="$(awk -v c="${conf:-0}" -v t="$RCC_CONF_HIGH" 'BEGIN{print (c+0>=t+0)?1:0}')"
+
+  # ---- branch: final ----
+  if [ "$gd" = "true" ] && [ "$hi_conf" = "1" ]; then
+    goal_set_status "$GF" "milestone-review"
+    run_review final final "$out"; rf="$REVIEW_FILE"
+    if [ "$REVIEW_VERDICT" = "PASS" ]; then
+      append_iter_row "$iter" "final review -> $rf" "PASS(done)"
+      finish "done" "goal complete — Fable final review PASSED"
+      exit 0
+    else
+      rcc_log "$SESSION" "FINAL review FAIL -> feeding back"
+      append_iter_row "$iter" "final review -> $rf" "FAIL"
+      mux_send "$SESSION" "Final review did NOT pass. Address this and continue: ${REVIEW_FEEDBACK:-see review}"
+      goal_set_status "$GF" "active"
+      sleep "$RCC_SLEEP"; continue
+    fi
+  fi
+
+  # ---- branch: milestone ----
+  if [ "$msd" = "true" ]; then
+    mcount=$((mcount + 1))
+    label="m$mcount"
+    milestone_txt="$(goal_next_milestone "$GF")"
+    goal_set_status "$GF" "milestone-review"
+    run_review milestone "$label" "$out"; rf="$REVIEW_FILE"
+    if [ "$REVIEW_VERDICT" = "PASS" ]; then
+      [ -n "$milestone_txt" ] && file_check_box "$GF" "$milestone_txt"
+      append_iter_row "$iter" "milestone '$milestone_txt' -> $rf" "PASS"
+      rcc_log "$SESSION" "MILESTONE $label PASS"
+      goal_set_status "$GF" "active"
+      # nudge worker onto the next milestone
+      nextm="$(goal_next_milestone "$GF")"
+      [ -n "$nextm" ] && mux_send "$SESSION" "Milestone accepted. Next milestone: $nextm"
+      sleep "$RCC_SLEEP"; continue
+    else
+      append_iter_row "$iter" "milestone '$milestone_txt' -> $rf" "FAIL"
+      rcc_log "$SESSION" "MILESTONE $label FAIL -> feeding back"
+      mux_send "$SESSION" "Milestone review did NOT pass. Fix this before proceeding: ${REVIEW_FEEDBACK:-see review}"
+      goal_set_status "$GF" "active"
+      sleep "$RCC_SLEEP"; continue
+    fi
+  fi
+
+  # ---- branch: keep working ----
+  [ -n "$nexti" ] || nexti="Continue toward the goal; make concrete progress and run the completion checks."
+  mux_send "$SESSION" "$nexti"
+  append_iter_row "$iter" "$nexti" "continue(conf=${conf:-?})"
+  rcc_log "$SESSION" "ITER $iter continue conf=${conf:-?}"
+  sleep "$RCC_SLEEP"
+done
+
+finish failed "reached max iterations ($RCC_MAX_ITERS) without completion"
+exit 1

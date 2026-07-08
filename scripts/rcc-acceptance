@@ -1,0 +1,78 @@
+#!/usr/bin/env bash
+# rcc-acceptance — run the LIVE acceptance checklist against real tmux + claude.
+# Run this on the real machine (needs tmux installed and API network access).
+set -u
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/rcc-common.sh"
+
+usage() {
+  cat <<EOF
+rcc-acceptance — live end-to-end check (real tmux + real headless claude)
+
+USAGE:
+  rcc-acceptance
+
+Creates a dummy tmux session 'test-target', round-trips send/read, verifies the
+haiku+fable model calls, runs one real dry-run loop iteration, then cleans up.
+Exit 0 iff every item passes.
+EOF
+}
+case "${1:-}" in -h|--help) usage; exit 0;; esac
+
+S="test-target"
+PASS=0; FAIL=0
+ok() { PASS=$((PASS+1)); echo "  PASS: $1"; }
+no() { FAIL=$((FAIL+1)); echo "  FAIL: $1"; }
+
+created=0
+cleanup() {
+  echo ""
+  echo "[6] cleanup"
+  "$RCC_SCRIPTS/rcc-stop" "$S" "acceptance cleanup" >/dev/null 2>&1 || true
+  if [ "$created" -eq 1 ] && tmux has-session -t "$S" 2>/dev/null; then
+    tmux kill-session -t "$S" 2>/dev/null && echo "  killed tmux session $S"
+  fi
+  rm -f "$RCC_GOALS/$S.md" "$RCC_LOGS/$S.log" "$RCC_LOGS/$S.loop.out" \
+        "$RCC_REVIEWS/$S-"*.md "$RCC_STATE/$S."* 2>/dev/null
+  echo "  removed test artifacts for $S"
+  echo ""
+  echo "=== acceptance: $PASS passed, $FAIL failed ==="
+}
+
+require_mux || { echo "Install tmux first (see 'rcc-list' error / README)."; exit 127; }
+rcc_have claude || die "claude CLI not found on PATH"
+trap cleanup EXIT   # only arm cleanup once prerequisites are satisfied
+
+echo "[1] discovery — create dummy session and list it"
+if tmux has-session -t "$S" 2>/dev/null; then
+  echo "  (session '$S' already exists — reusing; will NOT kill it on exit)"
+else
+  tmux new -d -s "$S" && created=1
+fi
+out="$("$RCC_SCRIPTS/rcc-list" 2>&1)"
+printf '%s\n' "$out"
+printf '%s' "$out" | grep -q "$S" && ok "rcc-list shows $S" || no "rcc-list shows $S"
+[ -f "$RCC_HOME/SESSIONS.md" ] && ok "SESSIONS.md refreshed" || no "SESSIONS.md refreshed"
+
+echo "[2] send/read round-trip"
+"$RCC_SCRIPTS/rcc-send" "$S" "echo hello-rcc-\$\$" --force >/dev/null 2>&1
+sleep 2
+rd="$("$RCC_SCRIPTS/rcc-read" "$S" 40 2>&1)"
+printf '%s' "$rd" | grep -q "hello-rcc-" && ok "sent text echoed back in pane" \
+  || { no "sent text echoed back in pane"; echo "  --- last pane ---"; printf '%s\n' "$rd" | tail -6; }
+
+echo "[3] headless model calls (haiku + fable)"
+if "$RCC_SCRIPTS/rcc-verify-models"; then ok "rcc-verify-models: all models resolve"
+else no "rcc-verify-models: a model failed (fix rcc.conf)"; fi
+
+echo "[4] one real dry-run loop iteration"
+"$RCC_SCRIPTS/rcc-goal" "$S" "dry run" "the string DONE appears in output" --no-loop >/dev/null 2>&1
+RCC_SLEEP=1 RCC_MAX_ITERS=1 "$RCC_SCRIPTS/rcc-loop" "$S" >/dev/null 2>&1
+gf="$RCC_GOALS/$S.md"
+grep -qE '^\| 1 \|' "$gf" && ok "iteration row written to goal file" || no "iteration row written to goal file"
+[ -f "$RCC_LOGS/$S.log" ] && grep -q "LOOP begin" "$RCC_LOGS/$S.log" && ok "loop wrote to logs/" || no "loop wrote to logs/"
+
+echo "[5] docs present"
+[ -f "$RCC_HOME/README.md" ] && [ -f "$RCC_HOME/CLAUDE.md" ] && ok "README.md and CLAUDE.md present" \
+  || no "README.md and CLAUDE.md present"
+
+# (cleanup + summary run via trap)

@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.rcc.ttyd</string>
+  <key>ProgramArguments</key><array>
+    <string>__TTYD__</string>
+    <string>-W</string>
+    <string>-i</string><string>__TS_IP__</string>
+    <string>/usr/bin/env</string><string>-u</string><string>TMUX</string>
+    <string>__TMUX__</string><string>new</string>
+    <string>-A</string><string>-s</string><string>control</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>__HOME__/rcc/logs/ttyd.log</string>
+  <key>StandardErrorPath</key><string>__HOME__/rcc/logs/ttyd.err</string>
+</dict></plist>

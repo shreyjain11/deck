@@ -1,0 +1,18 @@
+# RCC config — copy to rcc.conf to override defaults. Shell syntax; sourced by
+# rcc-common.sh. Environment variables still win over anything set here.
+
+# --- model routing ---
+# RCC_MODEL_WORKER=sonnet          # workers write code (you start these)
+# RCC_MODEL_EVAL=haiku             # per-iteration evaluator (cheapest)
+# RCC_MODEL_REVIEW=claude-fable-5  # milestone + final reviews
+#   If the short alias 'fable' works on your box, you may use it instead;
+#   rcc-verify-models will tell you. The full id is the safe default.
+
+# --- loop guards ---
+# RCC_MAX_ITERS=50                 # hard cap on iterations per goal
+# RCC_MAX_FAILS=5                  # consecutive evaluator failures -> failed
+# RCC_SLEEP=45                     # seconds between iterations (30-60)
+# RCC_READ_LINES=80                # pane lines the evaluator sees
+# RCC_STALL_READS=3                # identical reads before nudge/flag
+# RCC_SEND_WAIT=20                 # seconds to wait for a busy target
+# RCC_CONF_HIGH=0.8                # evaluator confidence gate for "done"

@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+# rcc-verify-models — confirm the routed model strings actually resolve
+set -u
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/rcc-common.sh"
+
+usage() {
+  cat <<EOF
+rcc-verify-models — send a trivial 'reply OK' to each routed model and report.
+
+USAGE:
+  rcc-verify-models
+
+Checks: eval ($RCC_MODEL_EVAL) and review ($RCC_MODEL_REVIEW), the two models
+RCC invokes headlessly. If one fails, set the correct string in rcc.conf
+(RCC_MODEL_EVAL / RCC_MODEL_REVIEW / RCC_MODEL_WORKER) and re-run.
+EOF
+}
+case "${1:-}" in -h|--help) usage; exit 0;; esac
+
+rcc_have claude || die "claude CLI not found on PATH"
+
+check() { # <label> <model>
+  local label="$1" model="$2" out
+  printf '%-8s %-22s ... ' "$label" "$model"
+  out="$(claude -p --model "$model" "reply with exactly: OK" 2>&1)"
+  if printf '%s' "$out" | grep -qi 'OK'; then
+    echo "PASS"
+    return 0
+  else
+    echo "FAIL"
+    printf '   -> %s\n' "$(printf '%s' "$out" | head -2 | tr '\n' ' ')"
+    return 1
+  fi
+}
+
+rc=0
+check eval   "$RCC_MODEL_EVAL"   || rc=1
+check review "$RCC_MODEL_REVIEW" || rc=1
+echo ""
+if [ "$rc" -eq 0 ]; then
+  echo "All routed models resolve."
+else
+  echo "One or more models failed — edit $RCC_HOME/rcc.conf and re-run."
+fi
+exit "$rc"

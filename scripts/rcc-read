@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# rcc-read — print the last N lines of a target session's pane
+set -u
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/rcc-common.sh"
+
+usage() {
+  cat <<EOF
+rcc-read — capture recent output from a target session
+
+USAGE:
+  rcc-read <session> [lines]
+
+Prints the last [lines] rows of the session's active pane (default ${RCC_READ_LINES}).
+EOF
+}
+
+[ $# -ge 1 ] || { usage; exit 2; }
+case "$1" in -h|--help) usage; exit 0;; esac
+
+SESSION="$1"
+LINES="${2:-$RCC_READ_LINES}"
+
+require_mux || exit 127
+mux_has_session "$SESSION" || die "no such tmux session: $SESSION"
+
+mux_capture "$SESSION" "$LINES"

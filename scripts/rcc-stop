@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+# rcc-stop — halt a session's loop cleanly and record a final summary
+set -u
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/rcc-common.sh"
+
+usage() {
+  cat <<EOF
+rcc-stop — stop the loop for a session and write a final summary
+
+USAGE:
+  rcc-stop <session> [reason]
+  rcc-stop --all [reason]
+EOF
+}
+
+[ $# -ge 1 ] || { usage; exit 2; }
+case "$1" in -h|--help) usage; exit 0;; esac
+
+stop_one() { # <session> <reason>
+  local s="$1" reason="${2:-manual stop}"
+  local pf="$RCC_STATE/$s.pid" gf="$RCC_GOALS/$s.md" pid
+  if [ -f "$pf" ]; then
+    pid="$(cat "$pf" 2>/dev/null)"
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+      kill "$pid" 2>/dev/null
+      sleep 1
+      kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null
+      echo "stopped loop for '$s' (pid $pid)"
+    else
+      echo "no live loop for '$s' (stale pid file removed)"
+    fi
+    rm -f "$pf"
+  else
+    echo "no loop pid recorded for '$s'"
+  fi
+  if [ -f "$gf" ]; then
+    goal_set_status "$gf" "stopped"
+    {
+      echo ""
+      echo "## Final summary (stopped)"
+      echo "- Stopped: $(rcc_ts)"
+      echo "- Reason: $reason"
+      echo "- Iterations logged: $(awk -F'|' '/^\| *[0-9]+ *\|/{c++} END{print c+0}' "$gf")"
+      echo "- Estimated spend: $(rcc_cost_total "$s")"
+    } >> "$gf"
+  fi
+  rcc_log "$s" "STOP ($reason)"
+}
+
+if [ "$1" = "--all" ]; then
+  reason="${2:-stop all}"
+  any=0
+  for pf in "$RCC_STATE"/*.pid; do
+    [ -f "$pf" ] || continue
+    any=1
+    stop_one "$(basename "$pf" .pid)" "$reason"
+  done
+  [ "$any" -eq 0 ] && echo "(no active loops)"
+  exit 0
+fi
+
+stop_one "$1" "${2:-manual stop}"

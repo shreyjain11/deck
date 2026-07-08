@@ -1,0 +1,183 @@
+#!/usr/bin/env bash
+# rcc-selftest — exercise RCC logic offline using mock `tmux` and `claude`.
+# Verifies discovery, send/read round-trip, model checks, and all three loop
+# branches (continue / milestone / final-done) WITHOUT network or a real mux.
+set -u
+SCRIPTS="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+case "${1:-}" in
+  -h|--help)
+    cat <<EOF
+rcc-selftest — exercise all RCC logic offline with mock tmux + claude.
+
+USAGE:
+  rcc-selftest
+
+Needs no network and no real tmux. Set RCC_SELFTEST_KEEP=1 to keep the
+temporary sandbox dir for inspection. Exit 0 iff every check passes.
+EOF
+    exit 0;;
+esac
+
+WORK="$(mktemp -d "${TMPDIR:-/tmp}/rcc-selftest.XXXXXX")"
+BIN="$WORK/bin"; MST="$WORK/mux"; mkdir -p "$BIN" "$MST"
+# isolated RCC_HOME so we never touch the real goals/logs
+export RCC_HOME="$WORK/home"
+mkdir -p "$RCC_HOME"
+# symlink real scripts into the sandbox home so RCC_HOME resolves there
+ln -s "$SCRIPTS" "$RCC_HOME/scripts"
+export MOCK_TMUX_STATE="$MST"
+export PATH="$BIN:$PATH"
+# Invoke scripts through the symlink so rcc-common resolves RCC_HOME -> $WORK/home
+RCS="$RCC_HOME/scripts"
+
+PASS=0; FAIL=0
+ok()  { PASS=$((PASS+1)); echo "  PASS: $1"; }
+no()  { FAIL=$((FAIL+1)); echo "  FAIL: $1"; }
+chk() { if eval "$2"; then ok "$1"; else no "$1 [ $2 ]"; fi; }
+
+cleanup() { [ -n "${RCC_SELFTEST_KEEP:-}" ] && { echo "kept: $WORK"; return; }; rm -rf "$WORK"; }
+trap cleanup EXIT
+
+# ---------------------------------------------------------------- mock tmux --
+cat > "$BIN/tmux" <<'MOCK'
+#!/usr/bin/env bash
+S="$MOCK_TMUX_STATE"; mkdir -p "$S"
+sub="$1"; shift || true
+# tiny -t/-F/-p/-S/-l parser
+targ=""; fmt=""; literal=0; startlines=""; rest=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -t) shift; targ="$1";;
+    -F) shift; fmt="$1";;
+    -p) : ;;
+    -a) : ;;
+    -l) literal=1;;
+    -S) shift; startlines="$1";;
+    --) shift; rest=("$@"); break;;
+    *) rest+=("$1");;
+  esac
+  shift
+done
+sess_file="$S/sessions"
+case "$sub" in
+  list-sessions) cat "$sess_file" 2>/dev/null;;
+  has-session)   grep -qx "$targ" "$sess_file" 2>/dev/null;;
+  capture-pane)  cat "$S/pane-$targ" 2>/dev/null;;
+  display-message) echo "$S/wd-$targ";;   # a (non-git) working dir path
+  list-panes)
+    while IFS= read -r s; do
+      [ -n "$s" ] || continue
+      printf '%s\t/dev/ttysMOCK\tclaude\t12345\n' "$s"
+    done < "$sess_file" 2>/dev/null;;
+  send-keys)
+    if [ "$literal" -eq 1 ]; then
+      printf '%s' "${rest[*]}" >> "$S/pane-$targ"
+      printf '%s\n' "${rest[*]}" >> "$S/sent-$targ"
+    else
+      case "${rest[*]}" in *Enter*|*C-m*) printf '\n' >> "$S/pane-$targ";; esac
+    fi;;
+  *) : ;;
+esac
+MOCK
+chmod +x "$BIN/tmux"
+
+# --------------------------------------------------------------- mock claude --
+cat > "$BIN/claude" <<'MOCK'
+#!/usr/bin/env bash
+# recognizes -p --model M [--output-format json] "<prompt>"
+json=0; prompt=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -p) : ;;
+    --model) shift;;
+    --output-format) shift; [ "$1" = "json" ] && json=1;;
+    *) prompt="$1";;
+  esac
+  shift
+done
+mode="${MOCK_MODE:-continue}"
+emit() { # <plain-result>
+  if [ "$json" -eq 1 ]; then
+    jq -n --arg r "$1" '{type:"result",result:$r,total_cost_usd:0.0012,usage:{output_tokens:20}}'
+  else
+    printf '%s' "$1"
+  fi
+}
+case "$prompt" in
+  *"reply with exactly: OK"*) emit "OK";;
+  *"automated evaluator"*)
+    case "$mode" in
+      done)      emit '{"milestone_done":false,"goal_done":true,"next_instruction":"finalize","confidence":0.95}';;
+      milestone) emit '{"milestone_done":true,"goal_done":false,"next_instruction":"do next","confidence":0.9}';;
+      *)         emit '{"milestone_done":false,"goal_done":false,"next_instruction":"write the failing test then implement","confidence":0.5}';;
+    esac;;
+  *"principal engineer"*) emit "VERDICT: PASS
+Looks correct and complete.
+Tests cover the criteria.";;
+  *"Summarize this Claude Code worker"*) emit "- made progress
+- tests added";;
+  *) emit "OK";;
+esac
+MOCK
+chmod +x "$BIN/claude"
+
+# ------------------------------------------------------------------ fixtures --
+printf 'test-target\nrcc-control\n' > "$MST/sessions"
+printf 'worker booting...\n$ claude --model sonnet\n' > "$MST/pane-test-target"
+mkdir -p "$MST/wd-test-target"   # non-git dir -> diff gather returns a clean note
+
+echo "=== rcc-selftest (isolated home: $RCC_HOME) ==="
+gf="$RCC_HOME/goals/test-target.md"
+
+echo "[1] discovery — rcc-list detects the claude session"
+out="$("$RCS/rcc-list" 2>&1)"
+chk "rcc-list shows test-target"      'printf "%s" "$out" | grep -q test-target'
+chk "rcc-list marks it claude=yes"    'printf "%s" "$out" | grep -q "test-target.*yes"'
+chk "SESSIONS.md was written"         '[ -f "$RCC_HOME/SESSIONS.md" ]'
+
+echo "[2] send/read round-trip"
+"$RCS/rcc-send" test-target "echo hello" --force >/dev/null 2>&1
+rd="$("$RCS/rcc-read" test-target 200 2>&1)"
+chk "sent text appears in pane read"  'printf "%s" "$rd" | grep -q "echo hello"'
+chk "send was logged"                 'grep -q "SEND: echo hello" "$RCC_HOME/logs/test-target.log"'
+
+echo "[3] model verification (mock)"
+"$RCS/rcc-verify-models" >/dev/null 2>&1; rc=$?
+chk "rcc-verify-models exits 0"       '[ "$rc" -eq 0 ]'
+
+echo "[4] dry-run loop — CONTINUE branch (1 iteration)"
+"$RCS/rcc-goal" test-target "add feature X" "npm test passes; lint clean" --no-loop >/dev/null 2>&1
+chk "goal file created"               '[ -f "$gf" ]'
+chk "completion criteria rendered"    'grep -q "\- \[ \] npm test passes" "$gf"'
+chk "second criterion rendered"       'grep -q "\- \[ \] lint clean" "$gf"'
+RCC_SLEEP=0 RCC_MAX_ITERS=1 MOCK_MODE=continue "$RCS/rcc-loop" test-target >/dev/null 2>&1
+chk "iteration row written"           'grep -qE "^\| 1 \|" "$gf"'
+chk "log grew for the loop"           'grep -q "LOOP begin" "$RCC_HOME/logs/test-target.log"'
+chk "next_instruction was sent"       'grep -q "write the failing test" "$MST/sent-test-target"'
+
+echo "[5] loop — MILESTONE branch (review PASS checks the box)"
+rm -f "$gf" "$RCC_HOME/logs/test-target.log"
+"$RCS/rcc-goal" test-target "ship it" "tests pass" "milestone one; milestone two" --no-loop >/dev/null 2>&1
+chk "both milestones rendered"        'grep -q "milestone two" "$gf"'
+RCC_SLEEP=0 RCC_MAX_ITERS=1 MOCK_MODE=milestone "$RCS/rcc-loop" test-target >/dev/null 2>&1
+chk "milestone review file written"   'ls "$RCC_HOME/reviews/test-target-m1.md" >/dev/null 2>&1'
+chk "first milestone checked off"     'grep -q "\- \[x\] milestone one" "$gf"'
+
+echo "[6] loop — FINAL branch (goal_done -> Fable PASS -> status done)"
+rm -f "$gf" "$RCC_HOME/logs/test-target.log"
+"$RCS/rcc-goal" test-target "finish" "criteria met" --no-loop >/dev/null 2>&1
+RCC_SLEEP=0 RCC_MAX_ITERS=3 MOCK_MODE=done "$RCS/rcc-loop" test-target >/dev/null 2>&1
+chk "final review file written"       'ls "$RCC_HOME/reviews/test-target-final.md" >/dev/null 2>&1'
+chk "review verdict is PASS"          'grep -q "Verdict: PASS" "$RCC_HOME/reviews/test-target-final.md"'
+chk "status set to done"              'grep -qE "^Status: done" "$gf"'
+chk "cost was accumulated"            '[ -f "$RCC_HOME/.state/test-target.cost" ]'
+
+echo "[7] rcc-status renders"
+st="$("$RCS/rcc-status" 2>&1)"
+chk "status lists the session"        'printf "%s" "$st" | grep -q test-target'
+chk "status shows spend"              'printf "%s" "$st" | grep -q "0\\.00"'
+
+echo ""
+echo "=== selftest: $PASS passed, $FAIL failed ==="
+[ "$FAIL" -eq 0 ]

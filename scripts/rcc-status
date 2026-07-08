@@ -1,0 +1,68 @@
+#!/usr/bin/env bash
+# rcc-status — one-screen dashboard across all goals
+set -u
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/rcc-common.sh"
+
+usage() {
+  cat <<EOF
+rcc-status — dashboard: every goal, its status, loop iteration count,
+last evaluator verdict, loop liveness, and estimated spend.
+
+USAGE:
+  rcc-status
+EOF
+}
+case "${1:-}" in -h|--help) usage; exit 0;; esac
+
+loop_alive() { # <session>
+  local pf="$RCC_STATE/$1.pid" pid
+  [ -f "$pf" ] || { echo "-"; return; }
+  pid="$(cat "$pf" 2>/dev/null)"
+  if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then echo "pid $pid"; else echo "dead"; fi
+}
+
+# iteration count = data rows in the goal file's iteration table
+iter_count() { awk -F'|' '/^\| *[0-9]+ *\|/{c++} END{print c+0}' "$1"; }
+
+# last evaluator verdict = last iteration row's verdict column
+last_verdict() {
+  awk -F'|' '/^\| *[0-9]+ *\|/{v=$5} END{gsub(/^ +| +$/,"",v); print (v==""?"-":v)}' "$1"
+}
+
+echo "RCC status — $(rcc_ts)"
+echo "models: worker=$RCC_MODEL_WORKER  eval=$RCC_MODEL_EVAL  review=$RCC_MODEL_REVIEW"
+echo ""
+
+shopt -s nullglob 2>/dev/null || true
+found=0
+{
+  printf 'SESSION\tSTATUS\tITERS\tLAST-VERDICT\tLOOP\tSPEND\tGOAL\n'
+  for gf in "$RCC_GOALS"/*.md; do
+    [ -f "$gf" ] || continue
+    s="$(basename "$gf" .md)"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+      "$s" \
+      "$(goal_status "$gf")" \
+      "$(iter_count "$gf")" \
+      "$(last_verdict "$gf")" \
+      "$(loop_alive "$s")" \
+      "$(rcc_cost_total "$s")" \
+      "$(goal_title "$gf" | cut -c1-40)"
+  done
+} | awk -F'\t' '{
+  for(i=1;i<=NF;i++){ w=length($i); if(w>max[i])max[i]=w }
+  line[NR]=$0
+} END {
+  for(r=1;r<=NR;r++){
+    n=split(line[r],c,"\t"); out="";
+    for(i=1;i<=n;i++){ pad=max[i]-length(c[i]); v=c[i]; while(pad-->0)v=v" "; out=out v "  " }
+    print out
+    if(r==1){ div=""; for(i=1;i<=n;i++){ k=max[i]; while(k-->0)div=div"-"; div=div"  " } print div }
+  }
+}'
+
+# note if truly empty
+count=0; for gf in "$RCC_GOALS"/*.md; do [ -f "$gf" ] && count=$((count+1)); done
+[ "$count" -eq 0 ] && echo "(no goals yet — create one with rcc-goal)"
+echo ""
+echo "Spend shown only when headless calls ran with JSON output (jq present)."

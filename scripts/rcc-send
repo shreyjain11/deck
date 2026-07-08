@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+# rcc-send — type a prompt into a target tmux session and submit it
+set -u
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/rcc-common.sh"
+
+usage() {
+  cat <<EOF
+rcc-send — inject a prompt into a target session (send-keys + Enter)
+
+USAGE:
+  rcc-send <session> "<prompt>" [--force] [--wait N]
+
+Detects whether the target is mid-response (its pane output is still changing).
+If busy, waits up to \$RCC_SEND_WAIT (${RCC_SEND_WAIT}s) for it to settle; if it
+stays busy it warns and queues the prompt anyway (tmux buffers the keystrokes).
+
+  --force     don't wait; send immediately
+  --wait N    override the settle timeout (seconds)
+EOF
+}
+
+[ $# -ge 1 ] || { usage; exit 2; }
+case "$1" in -h|--help) usage; exit 0;; esac
+[ $# -ge 2 ] || die "need a session and a prompt"
+
+SESSION="$1"; PROMPT="$2"; shift 2
+FORCE=0; WAIT="$RCC_SEND_WAIT"
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --force) FORCE=1;;
+    --wait) shift; WAIT="${1:-$WAIT}";;
+    *) warn "ignoring unknown arg: $1";;
+  esac
+  shift
+done
+
+require_mux || exit 127
+mux_has_session "$SESSION" || die "no such tmux session: $SESSION"
+
+# ---- busy detection: is the pane output still changing? ---------------------
+is_busy() {
+  local a b
+  a="$(mux_capture "$SESSION" 25 | rcc_hash)"
+  sleep 1
+  b="$(mux_capture "$SESSION" 25 | rcc_hash)"
+  [ "$a" != "$b" ]
+}
+
+if [ "$FORCE" -eq 0 ]; then
+  waited=0
+  while is_busy; do
+    if [ "$waited" -ge "$WAIT" ]; then
+      warn "target '$SESSION' still busy after ${WAIT}s — queuing prompt anyway"
+      break
+    fi
+    sleep 2; waited=$((waited + 3))   # is_busy already consumed ~1s + 2s here
+  done
+fi
+
+if mux_send "$SESSION" "$PROMPT"; then
+  short="$(printf '%s' "$PROMPT" | tr '\n' ' ' | cut -c1-70)"
+  rcc_log "$SESSION" "SEND: $short"
+  echo "sent to '$SESSION': $short"
+else
+  rcc_log "$SESSION" "SEND-FAILED"
+  die "send-keys to '$SESSION' failed"
+fi
