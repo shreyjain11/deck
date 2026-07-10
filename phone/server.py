@@ -35,13 +35,17 @@ def tail(n, c=40):
     return tx("capture-pane", "-pt", n).rstrip("\n").split("\n")[-c:]
 
 def status_of(lines):
-    # Scan the WHOLE visible pane, not just the tail: Claude pins its mode line
-    # ("accept edits on …") at the very bottom, so an approval prompt sits above it.
-    t = "\n".join(lines).lower()
-    if ("do you want to proceed" in t or "requires approval" in t
-            or "esc to cancel" in t or "tab to amend" in t
-            or "yes, allow" in t or "no, and tell claude" in t
-            or "yes, and don't ask" in t):
+    # Live-state markers (the prompt's footer, the working spinner) always sit at
+    # the BOTTOM of the pane. Scanning the whole buffer matched STALE text left
+    # over from earlier (a finished command's "esc to interrupt", an old prompt),
+    # which reported WORKING/INPUT when the session was actually idle. So only look
+    # at the last few lines. The prompt FOOTER ("esc to cancel · tab to amend") is
+    # always near the bottom even when the question itself is pushed up by a long
+    # wrapped command, so this still catches real prompts.
+    t = "\n".join(lines[-14:]).lower()
+    if ("esc to cancel" in t or "tab to amend" in t
+            or "do you want to proceed" in t or "requires approval" in t
+            or "yes, allow" in t or "no, and tell claude" in t):
         return "input"
     if "esc to interrupt" in t:
         return "working"
@@ -483,8 +487,8 @@ body.termmode #chat,body.termmode #empty{display:none}body.termmode #term{displa
 let CUR="",TERM=false,tset=false,hasSess=false,es=null;
 let msgKeys=[],cardEls={},browsePath="",browseParent="",HIST=[];
 const P=u=>fetch(u,{method:'POST'}).catch(()=>{});
-function k(x){P('/key?k='+encodeURIComponent(x))}
-function cmd(c){P('/type?t='+encodeURIComponent(c))}
+function k(x){P('/key?s='+encodeURIComponent(CUR)+'&k='+encodeURIComponent(x))}
+function cmd(c){P('/type?s='+encodeURIComponent(CUR)+'&t='+encodeURIComponent(c))}
 function send(){let t=document.getElementById('txt');if(!t.value.trim())return;cmd(t.value);t.value='';t.style.height='auto'}
 function kill(){if(CUR&&confirm('Kill "'+CUR+'"?'))P('/kill?s='+encodeURIComponent(CUR)).then(()=>setTimeout(()=>location.reload(),600))}
 function toggle(){TERM=!TERM;document.body.classList.toggle('termmode',TERM);
@@ -537,10 +541,13 @@ function applyChat(ms){
 
 /* ---- in-place card diff (bug 2d): no full rebuild, no flicker ---- */
 function applyState(d){
- CUR=d.current;
- document.getElementById('count').textContent=d.sessions.length+' sessions · '+(CUR||'—');
  let el=document.getElementById('cards'),names=d.sessions.map(x=>x.name);
  hasSess=names.length>0;
+ // CUR is THIS phone's chosen session. NEVER overwrite it from the server's shared
+ // 'current' on a routine tick — that made messages/keys land in a different session.
+ // Only (re)derive it when it's unset or its session has vanished.
+ if(!CUR||names.indexOf(CUR)<0){CUR=(names.indexOf(d.current)>=0?d.current:(names[0]||""));if(CUR)subscribe()}
+ document.getElementById('count').textContent=d.sessions.length+' sessions · '+(CUR||'—');
  for(let nm in cardEls){if(names.indexOf(nm)<0){el.removeChild(cardEls[nm].root);delete cardEls[nm]}}
  d.sessions.forEach(s=>{
   let c=cardEls[s.name];
@@ -555,7 +562,6 @@ function applyState(d){
   if(c.st.className!=='st '+s.status)c.st.className='st '+s.status;
   let pv=s.preview||'—';if(c.pv.textContent!==pv)c.pv.textContent=pv;
   let on=s.name===CUR;if(c.root.classList.contains('on')!==on)c.root.classList.toggle('on',on)});
- if(hasSess&&names.indexOf(CUR)<0){selectSession(names[0])}
  if(!hasSess){let chat=document.getElementById('chat'),empty=document.getElementById('empty');
   chat.style.display='none';empty.style.display='flex';
   empty.textContent='No sessions yet. Tap ＋ New (top right) to start one, or run  cc <name>  on your Mac.'}}
@@ -637,6 +643,34 @@ subscribe();
 </script></body></html>"""
 
 
+def ack_page(approved, sess):
+    """Tiny confirmation page shown after an ntfy 'view' action fires the key."""
+    sess = (sess or "").replace("&", "&amp;").replace("<", "&lt;")
+    icon = "&#10003;" if approved else "&#10005;"
+    word = "Approved" if approved else "Denied"
+    col = "#2ea043" if approved else "#e5534b"
+    return ("<!doctype html><meta charset=utf-8>"
+            "<meta name=viewport content='width=device-width,initial-scale=1'>"
+            "<body style='margin:0;height:100dvh;background:#0d0f12;color:#e8eaed;"
+            "font-family:-apple-system,sans-serif;display:flex;flex-direction:column;"
+            "align-items:center;justify-content:center;gap:8px'>"
+            "<div style='font-size:64px;color:%s'>%s</div>"
+            "<div style='font-size:22px;font-weight:800'>%s</div>"
+            "<div style='color:#8a919c;font-size:14px'>%s</div>"
+            "<a href='/' style='margin-top:24px;background:#3d5afe;color:#fff;"
+            "text-decoration:none;padding:14px 28px;border-radius:14px;font-weight:700;"
+            "font-size:16px'>Open Deck</a></body>") % (col, icon, word, sess)
+
+
+def action_log(msg):
+    """Audit trail of remote actions — shows exactly what the phone sends/reaches."""
+    try:
+        with open(os.path.join(HOME, "rcc", "logs", "actions.log"), "a") as f:
+            f.write("%s  %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), msg))
+    except Exception:
+        pass
+
+
 class H(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     def log_message(self, *a): pass
@@ -693,6 +727,14 @@ class H(BaseHTTPRequestHandler):
                 self._s(json.dumps(dirs()), "application/json; charset=utf-8")
             elif q.path == "/ls":
                 self._s(json.dumps(list_subdirs(g("dir"))), "application/json; charset=utf-8")
+            elif q.path == "/approve" or q.path == "/deny":
+                tgt = g("s") or sel()
+                key = "Enter" if q.path == "/approve" else "Escape"
+                exists = tgt in sessions()
+                if tgt:
+                    subprocess.run([TMUX, "send-keys", "-t", tgt, key])
+                action_log("%s s=%s key=%s session_exists=%s" % (q.path[1:], tgt, key, exists))
+                self._s(ack_page(q.path == "/approve", tgt))
             elif q.path == "/events":
                 self.do_events(g("s") or sel())
             else:
@@ -708,12 +750,18 @@ class H(BaseHTTPRequestHandler):
             if q.path == "/switch" and g("s") in sessions():
                 switch(g("s"))
             elif q.path == "/key":
-                subprocess.run([TMUX, "send-keys", "-t", sel(), g("k")])
+                tgt = g("s") or sel()
+                subprocess.run([TMUX, "send-keys", "-t", tgt, g("k")])
+                action_log("key s=%s k=%s session_exists=%s" % (tgt, g("k"), tgt in sessions()))
             elif q.path == "/keyto" and g("s"):
                 subprocess.run([TMUX, "send-keys", "-t", g("s"), g("k")])
+                action_log("keyto s=%s k=%s session_exists=%s" % (g("s"), g("k"), g("s") in sessions()))
             elif q.path == "/type":
-                subprocess.run([TMUX, "send-keys", "-t", sel(), "-l", "--", g("t")])
-                subprocess.run([TMUX, "send-keys", "-t", sel(), "Enter"])
+                tgt = g("s") or sel()
+                subprocess.run([TMUX, "send-keys", "-t", tgt, "-l", "--", g("t")])
+                time.sleep(0.15)                       # let the paste register before Enter
+                subprocess.run([TMUX, "send-keys", "-t", tgt, "Enter"])
+                action_log("type s=%s len=%d session_exists=%s" % (tgt, len(g("t")), tgt in sessions()))
             elif q.path == "/new":
                 dd = g("dir") or HOME
                 nm = g("s") or os.path.basename(dd.rstrip("/")) or "session"

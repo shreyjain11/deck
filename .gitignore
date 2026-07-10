@@ -26,3 +26,5 @@ __pycache__/
 *.pyc
 .claude/
 .DS_Store
+
+scratch.py

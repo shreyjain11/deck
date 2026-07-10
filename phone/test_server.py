@@ -22,8 +22,15 @@ ok(srv.status_of(["This command requires approval", "Do you want to proceed?",
    "input detected even with mode line pinned below (the reported bug)")
 ok(srv.status_of(["Esc to cancel · Tab to amend · ctrl+e to explain",
                   "  ⏵⏵ accept edits on (shift+tab to cycle)"]) == "input", "input: prompt footer")
-ok(srv.status_of(["working on it (esc to interrupt)"]) == "working", "working detected")
+ok(srv.status_of(["some output", "  Working… (esc to interrupt)"]) == "working", "live working indicator -> working")
 ok(srv.status_of(["some output line", "  ⏵⏵ accept edits on (shift+tab to cycle)"]) == "idle", "idle detected")
+# regression: stale indicators left high in the buffer must NOT be counted (they were)
+ok(srv.status_of(["build step (esc to interrupt)"] + ["out %d" % i for i in range(20)]
+                 + ["  ⏵⏵ accept edits on (shift+tab to cycle)"]) == "idle",
+   "stale 'esc to interrupt' high in buffer -> idle (no false WORKING)")
+ok(srv.status_of(["This command requires approval", "Do you want to proceed?"]
+                 + ["opt %d" % i for i in range(20)] + ["  ⏵⏵ accept edits on"]) == "idle",
+   "stale prompt text high in buffer -> idle (no false INPUT / spurious reminders)")
 ok(srv.pick_preview(["Do you want to proceed?",
                      "  ⏵⏵ accept edits on (shift+tab to cycle) · ← for agents"]) == "Do you want to proceed?",
    "preview skips the mode line and shows the real prompt")

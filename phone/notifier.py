@@ -62,22 +62,44 @@ def extra_alert(text):
     if not _imessage(text):     # prefer free/local iMessage; fall back to Twilio SMS
         _twilio(text)
 
+REMIND_SEC = 300   # re-notify every 5 min while a prompt is still unanswered
+
+def notify_approval(n, first):
+    q = urllib.parse.quote(n)
+    # 'view' actions open the URL in Safari (foreground -> Tailscale routes it,
+    # cleartext allowed). Background 'http' POSTs from the ntfy app do NOT reach
+    # a cleartext tailnet endpoint on iOS, so tapping those did nothing.
+    ap = "http://%s:7682/approve?s=%s" % (TS, q)
+    dn = "http://%s:7682/deny?s=%s" % (TS, q)
+    msg = ("Claude is waiting for you. Tap Approve to allow, or Deny to cancel."
+           if first else "Still waiting - tap Approve to allow, or Deny to cancel.")
+    push(("%s needs approval" if first else "%s still needs approval") % n, msg,
+         [{"action": "view", "label": "Approve", "url": ap, "clear": True},
+          {"action": "view", "label": "Deny", "url": dn, "clear": True}],
+         pri=5)
+    extra_alert("%s needs your approval - open Deck to respond." % n)
+
 last = {}
+pending = {}       # session -> time we last pushed an approval (drives reminders)
 while True:
+    now = time.time()
+    names = set()
     for s in get():
         n = s["name"]; st = s["status"]
         if n == "control":
             continue
+        names.add(n)
         prev = last.get(n)
-        if st == "input" and prev != "input":
-            base = "http://%s:7682/keyto?s=%s" % (TS, urllib.parse.quote(n))
-            push("%s needs approval" % n,
-                 "Claude is waiting for you. Approve to allow, or Deny to cancel.",
-                 [{"action": "http", "label": "Approve", "url": base + "&k=Enter", "method": "POST", "clear": True},
-                  {"action": "http", "label": "Deny", "url": base + "&k=Escape", "method": "POST", "clear": True}],
-                 pri=5)
-            extra_alert("%s needs your approval - open Deck to respond." % n)
-        elif st == "idle" and prev == "working":
-            push("%s finished" % n, "Session is done and back to idle.", pri=3)
+        if st == "input":
+            if prev != "input" or now - pending.get(n, 0) >= REMIND_SEC:
+                notify_approval(n, prev != "input")
+                pending[n] = now
+        else:
+            pending.pop(n, None)                     # answered/moved on -> stop reminding
+            if st == "idle" and prev == "working":
+                push("%s finished" % n, "Session is done and back to idle.", pri=3)
         last[n] = st
+    for d in (last, pending):                        # forget sessions that vanished
+        for k in [k for k in d if k not in names]:
+            d.pop(k, None)
     time.sleep(3)

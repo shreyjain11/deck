@@ -20,14 +20,15 @@ function makeNode(tag) {
     set innerHTML(v){ if (v === '') this.children.length = 0; this._h = String(v); },
     get innerHTML(){ return this._h; },
     appendChild(c){ this.children.push(c); return c; },
+    removeChild(c){ const i = this.children.indexOf(c); if (i >= 0) this.children.splice(i, 1); return c; },
     classList: { _s:new Set(),
       add(x){this._s.add(x);}, remove(x){this._s.delete(x);},
       contains(x){return this._s.has(x);}, toggle(x,f){f?this._s.add(x):this._s.delete(x);} },
     querySelector(){ return makeNode('span'); },
   };
 }
-const chatEl = makeNode('div'), emptyEl = makeNode('div'), countEl = makeNode('div');
-const byId = { chat: chatEl, empty: emptyEl, count: countEl };
+const chatEl = makeNode('div'), emptyEl = makeNode('div'), countEl = makeNode('div'), cardsEl = makeNode('div');
+const byId = { chat: chatEl, empty: emptyEl, count: countEl, cards: cardsEl };
 global.document = {
   getElementById: id => byId[id] || makeNode('div'),
   createElement: makeNode,
@@ -41,7 +42,8 @@ global.confirm = () => false;
 
 // expose the closures we want to test
 js += "\nglobalThis.__md=md;globalThis.__esc=esc;globalThis.__applyChat=applyChat;"
-    + "globalThis.__setCUR=v=>{CUR=v};globalThis.__resetKeys=()=>{msgKeys=[]};";
+    + "globalThis.__setCUR=v=>{CUR=v};globalThis.__resetKeys=()=>{msgKeys=[]};"
+    + "globalThis.__applyState=applyState;globalThis.__selectSession=selectSession;globalThis.__getCUR=()=>CUR;";
 (0, eval)(js);
 const { __md, __esc, __applyChat, __setCUR, __resetKeys } = globalThis;
 
@@ -83,6 +85,19 @@ ok(chatEl.children.length === 2 && chatEl.children[0] !== ref0, 'divergent list 
 // empty -> empty state
 __applyChat([]);
 ok(chatEl.children.length === 0 && emptyEl.style.display === 'flex', 'empty list => empty state shown');
+
+console.log('[session targeting — the garble fix]');
+const { __applyState, __selectSession, __getCUR } = globalThis;
+__setCUR('');
+const S2 = { name: 'B', status: 'idle', preview: 'y' }, S1 = { name: 'A', status: 'idle', preview: 'x' };
+__applyState({ current: 'A', sessions: [S1, S2] });
+ok(__getCUR() === 'A', 'unset -> CUR derives from server current');
+__selectSession('B');
+ok(__getCUR() === 'B', 'tapping B selects B');
+__applyState({ current: 'A', sessions: [S1, S2] });   // routine tick, shared current still A
+ok(__getCUR() === 'B', 'CUR stays B despite server current=A (no cross-session garble)');
+__applyState({ current: 'A', sessions: [S1] });        // B vanished
+ok(__getCUR() === 'A', 'CUR re-derives only when its session disappears');
 
 console.log('\n=== js: ' + P + ' passed, ' + Fl + ' failed ===');
 process.exit(Fl ? 1 : 0);
