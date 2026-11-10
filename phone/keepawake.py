@@ -2,13 +2,16 @@
 """keepawake v3 — hold sleep off while (AC power) OR (Claude running, on battery),
 with guardrails: time cap, battery floor, thermal release, ntfy alerts, logging.
 Config: ~/rcc/keepawake.conf (created with defaults on first run)."""
-import json, os, subprocess, time, urllib.request
+import json, os, shutil, signal, subprocess, sys, time, urllib.request
 
 HOME = os.path.expanduser("~")
 LOG  = os.path.join(HOME, "rcc/logs/keepawake.log")
 CONF = os.path.join(HOME, "rcc/keepawake.conf")
 TOPIC_F = os.path.join(HOME, "rcc/.ntfy_topic")
-TMUX = "/opt/homebrew/bin/tmux"
+# Apple silicon and Intel Homebrew prefixes (launchd's PATH has neither).
+TMUX = next((p for p in (os.environ.get("DECK_TMUX"), "/opt/homebrew/bin/tmux",
+                         "/usr/local/bin/tmux") if p and os.path.exists(p)),
+            shutil.which("tmux") or "tmux")
 
 DEFAULTS = {"batt_floor": 20, "max_hold_hours": 4.0, "thermal_limit": 70, "notify": 1}
 
@@ -104,7 +107,18 @@ def set_hold(on, kind=None, reason=""):
         if hold_kind == "battery" and reason not in ("ac", "sessions-ended"):
             notify("Deck: Mac will sleep", "Reason: %s. It will be unreachable until woken." % reason)
 
+def stop(signum, frame):
+    set_hold(False, reason="keepawake stopped")
+    sys.exit(0)
+
+signal.signal(signal.SIGTERM, stop)        # launchctl bootout / unload / restart
+signal.signal(signal.SIGINT, stop)
+
 log("keepawake v3 started")
+# disablesleep survives this process. An instance that died mid-hold (crash, restart,
+# unload) left it at 1, and a fresh instance starts with holding=False, so nothing
+# ever reset it: the Mac would never sleep again, even lid-closed on battery.
+subprocess.run(["sudo", "/usr/bin/pmset", "-a", "disablesleep", "0"])
 while True:
     try:
         c = conf()

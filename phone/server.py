@@ -1,8 +1,17 @@
 #!/usr/bin/env python3
-import json, glob, os, subprocess, sys, time, urllib.parse, threading
+import json, glob, os, shutil, subprocess, sys, time, urllib.parse, threading
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 
-TMUX = "/opt/homebrew/bin/tmux"
+def find_tmux():
+    # launchd's PATH has no Homebrew dirs, so look in both prefixes explicitly:
+    # /opt/homebrew (Apple silicon) and /usr/local (Intel). Hardcoding only the
+    # first left Intel Macs with an empty, silently broken panel.
+    for p in (os.environ.get("DECK_TMUX"), "/opt/homebrew/bin/tmux", "/usr/local/bin/tmux"):
+        if p and os.path.exists(p):
+            return p
+    return shutil.which("tmux") or "tmux"
+
+TMUX = find_tmux()
 HOME = os.path.expanduser("~")
 PROJECTS = os.path.join(HOME, ".claude", "projects")
 INDEX_FILE = os.path.join(HOME, "rcc", ".state", "deck_index.json")
@@ -25,6 +34,15 @@ def tx(*a):
 def sessions():
     return [s for s in tx("list-sessions", "-F", "#{session_name}").split("\n") if s]
 
+# Exact tmux targets. A bare name falls back to a PREFIX match once that session is
+# gone: "-t decktest" lands in "decktest2", so an Approve for a closed session sent
+# Enter into a different one. "=name" matches exactly; panes need the trailing ":".
+def pane(n):
+    return "=%s:" % n
+
+def sess_t(n):
+    return "=%s" % n
+
 def sel():
     global SELECTED
     if SELECTED not in sessions():
@@ -32,7 +50,7 @@ def sel():
     return SELECTED
 
 def tail(n, c=40):
-    return tx("capture-pane", "-pt", n).rstrip("\n").split("\n")[-c:]
+    return tx("capture-pane", "-pt", pane(n)).rstrip("\n").split("\n")[-c:]
 
 def status_of(lines):
     # Live-state markers (the prompt's footer, the working spinner) always sit at
@@ -82,7 +100,7 @@ def session_cwd(n):
     c = _SESS_CWD.get(n)
     if c and now - c[0] < 2:
         return c[1]
-    cwd = tx("display-message", "-p", "-t", n, "#{pane_current_path}").strip()
+    cwd = tx("display-message", "-p", "-t", pane(n), "#{pane_current_path}").strip()
     _SESS_CWD[n] = (now, cwd)
     return cwd
 
@@ -363,7 +381,7 @@ def switch(n):
     global SELECTED
     SELECTED = n
     for c in [x for x in tx("list-clients", "-F", "#{client_name}").split("\n") if x]:
-        subprocess.run([TMUX, "switch-client", "-c", c, "-t", n])
+        subprocess.run([TMUX, "switch-client", "-c", c, "-t", sess_t(n)])
 
 def make_session(name, cwd, resume=False):
     name = uniq_name(name)
@@ -372,10 +390,10 @@ def make_session(name, cwd, resume=False):
     subprocess.run([TMUX, "new-session", "-d", "-s", name, "-c", cwd])
     if resume:
         # login shell already set PATH; send the command literally then Enter
-        subprocess.run([TMUX, "send-keys", "-t", name, "-l", "--", "claude --continue"])
-        subprocess.run([TMUX, "send-keys", "-t", name, "Enter"])
+        subprocess.run([TMUX, "send-keys", "-t", pane(name), "-l", "--", "claude --continue"])
+        subprocess.run([TMUX, "send-keys", "-t", pane(name), "Enter"])
     else:
-        subprocess.run([TMUX, "send-keys", "-t", name, "claude", "Enter"])
+        subprocess.run([TMUX, "send-keys", "-t", pane(name), "claude", "Enter"])
     switch(name)
     return name
 
@@ -487,9 +505,9 @@ body.termmode #chat,body.termmode #empty{display:none}body.termmode #term{displa
 let CUR="",TERM=false,tset=false,hasSess=false,es=null;
 let msgKeys=[],cardEls={},browsePath="",browseParent="",HIST=[];
 const P=u=>fetch(u,{method:'POST'}).catch(()=>{});
-function k(x){P('/key?s='+encodeURIComponent(CUR)+'&k='+encodeURIComponent(x))}
-function cmd(c){P('/type?s='+encodeURIComponent(CUR)+'&t='+encodeURIComponent(c))}
-function send(){let t=document.getElementById('txt');if(!t.value.trim())return;cmd(t.value);t.value='';t.style.height='auto'}
+function k(x){if(CUR)P('/key?s='+encodeURIComponent(CUR)+'&k='+encodeURIComponent(x))}
+function cmd(c){if(CUR)P('/type?s='+encodeURIComponent(CUR)+'&t='+encodeURIComponent(c))}
+function send(){let t=document.getElementById('txt');if(!t.value.trim()||!CUR)return;cmd(t.value);t.value='';t.style.height='auto'}
 function kill(){if(CUR&&confirm('Kill "'+CUR+'"?'))P('/kill?s='+encodeURIComponent(CUR)).then(()=>setTimeout(()=>location.reload(),600))}
 function toggle(){TERM=!TERM;document.body.classList.toggle('termmode',TERM);
  document.getElementById('mode').textContent=TERM?'Clean':'Terminal';
@@ -643,12 +661,21 @@ subscribe();
 </script></body></html>"""
 
 
-def ack_page(approved, sess):
+ACK = {   # result -> (color, icon, headline, detail)
+    "approved": ("#2ea043", "&#10003;", "Approved", ""),
+    "denied":   ("#e5534b", "&#10005;", "Denied", ""),
+    "stale":    ("#8a919c", "&#8212;", "Nothing to answer",
+                 "That prompt was already answered. No key was sent."),
+    "gone":     ("#8a919c", "&#8212;", "Session not found",
+                 "It was closed or renamed. No key was sent."),
+}
+
+def ack_page(result, sess):
     """Tiny confirmation page shown after an ntfy 'view' action fires the key."""
-    sess = (sess or "").replace("&", "&amp;").replace("<", "&lt;")
-    icon = "&#10003;" if approved else "&#10005;"
-    word = "Approved" if approved else "Denied"
-    col = "#2ea043" if approved else "#e5534b"
+    col, icon, word, detail = ACK.get(result, ACK["gone"])
+    sess = (sess or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    if detail:
+        sess = "%s<br>%s" % (sess, detail)
     return ("<!doctype html><meta charset=utf-8>"
             "<meta name=viewport content='width=device-width,initial-scale=1'>"
             "<body style='margin:0;height:100dvh;background:#0d0f12;color:#e8eaed;"
@@ -656,7 +683,7 @@ def ack_page(approved, sess):
             "align-items:center;justify-content:center;gap:8px'>"
             "<div style='font-size:64px;color:%s'>%s</div>"
             "<div style='font-size:22px;font-weight:800'>%s</div>"
-            "<div style='color:#8a919c;font-size:14px'>%s</div>"
+            "<div style='color:#8a919c;font-size:14px;text-align:center;padding:0 24px'>%s</div>"
             "<a href='/' style='margin-top:24px;background:#3d5afe;color:#fff;"
             "text-decoration:none;padding:14px 28px;border-radius:14px;font-weight:700;"
             "font-size:16px'>Open Deck</a></body>") % (col, icon, word, sess)
@@ -680,9 +707,28 @@ class H(BaseHTTPRequestHandler):
         self.send_response(code)
         self.send_header("Content-Type", t)
         self.send_header("Content-Length", str(len(body)))
-        self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
         self.wfile.write(body)
+
+    def _redirect(self, loc):
+        self.send_response(303)
+        self.send_header("Location", loc)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def _cross_site(self):
+        """True if a browser sent this request from another site. The panel has no
+        login, so without this check any web page open on a tailnet device could
+        POST /type (run commands in a session) or load /approve. The panel's own
+        page sends same-origin markers; curl and notifier.py send none, so they pass."""
+        if (self.headers.get("Sec-Fetch-Site") or "").lower() in ("cross-site", "same-site"):
+            return True
+        host = (self.headers.get("Host") or "").lower()
+        for h in ("Origin", "Referer"):
+            v = self.headers.get(h)
+            if v and urllib.parse.urlsplit(v).netloc.lower() != host:
+                return True                     # includes Origin: null
+        return False
 
     def _sse_send(self, event, data):
         self.wfile.write(("event: %s\ndata: %s\n\n" % (event, data)).encode())
@@ -694,7 +740,6 @@ class H(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "text/event-stream")
             self.send_header("Cache-Control", "no-cache")
             self.send_header("Connection", "keep-alive")
-            self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
             laststate = None; lastchat = None; beat = 0
             while True:
@@ -728,13 +773,26 @@ class H(BaseHTTPRequestHandler):
             elif q.path == "/ls":
                 self._s(json.dumps(list_subdirs(g("dir"))), "application/json; charset=utf-8")
             elif q.path == "/approve" or q.path == "/deny":
-                tgt = g("s") or sel()
-                key = "Enter" if q.path == "/approve" else "Escape"
-                exists = tgt in sessions()
-                if tgt:
-                    subprocess.run([TMUX, "send-keys", "-t", tgt, key])
-                action_log("%s s=%s key=%s session_exists=%s" % (q.path[1:], tgt, key, exists))
-                self._s(ack_page(q.path == "/approve", tgt))
+                if self._cross_site():
+                    return self._s("cross-site request refused", "text/plain; charset=utf-8", 403)
+                tgt = g("s"); approve = q.path == "/approve"
+                # Only press the key while the prompt is still up. A late tap on an old
+                # notification used to send Enter to whatever was on screen, and a late
+                # Deny sent Escape, which interrupts a Claude that is mid-task.
+                if tgt not in sessions():
+                    result = "gone"
+                elif status(tgt) != "input":
+                    result = "stale"
+                else:
+                    subprocess.run([TMUX, "send-keys", "-t", pane(tgt),
+                                    "Enter" if approve else "Escape"])
+                    result = "approved" if approve else "denied"
+                action_log("%s s=%s result=%s" % (q.path[1:], tgt, result))
+                # Redirect so reloading this tab (iOS Safari does it on tab restore)
+                # shows the result again instead of pressing the key a second time.
+                self._redirect("/ack?r=%s&s=%s" % (result, urllib.parse.quote(tgt)))
+            elif q.path == "/ack":
+                self._s(ack_page(g("r"), g("s")))
             elif q.path == "/events":
                 self.do_events(g("s") or sel())
             else:
@@ -744,24 +802,28 @@ class H(BaseHTTPRequestHandler):
 
     def do_POST(self):
         try:
+            if self._cross_site():
+                return self._s("cross-site request refused", "text/plain; charset=utf-8", 403)
             q = urllib.parse.urlparse(self.path); p = urllib.parse.parse_qs(q.query)
             g = lambda k: p.get(k, [""])[0]
             body = "ok"
-            if q.path == "/switch" and g("s") in sessions():
-                switch(g("s"))
-            elif q.path == "/key":
-                tgt = g("s") or sel()
-                subprocess.run([TMUX, "send-keys", "-t", tgt, g("k")])
-                action_log("key s=%s k=%s session_exists=%s" % (tgt, g("k"), tgt in sessions()))
-            elif q.path == "/keyto" and g("s"):
-                subprocess.run([TMUX, "send-keys", "-t", g("s"), g("k")])
-                action_log("keyto s=%s k=%s session_exists=%s" % (g("s"), g("k"), g("s") in sessions()))
+            tgt = g("s")
+            if q.path in ("/switch", "/key", "/keyto", "/type", "/kill") and tgt not in sessions():
+                # Never guess a target. An empty name used to fall back to the selected
+                # session, which with no Claude sessions open is the 'control' shell, so
+                # a chat message from the phone ran there as a shell command.
+                action_log("%s s=%s refused: no such session" % (q.path[1:], tgt))
+                return self._s("no such session", "text/plain; charset=utf-8", 404)
+            if q.path == "/switch":
+                switch(tgt)
+            elif q.path in ("/key", "/keyto"):
+                subprocess.run([TMUX, "send-keys", "-t", pane(tgt), g("k")])
+                action_log("%s s=%s k=%s" % (q.path[1:], tgt, g("k")))
             elif q.path == "/type":
-                tgt = g("s") or sel()
-                subprocess.run([TMUX, "send-keys", "-t", tgt, "-l", "--", g("t")])
+                subprocess.run([TMUX, "send-keys", "-t", pane(tgt), "-l", "--", g("t")])
                 time.sleep(0.15)                       # let the paste register before Enter
-                subprocess.run([TMUX, "send-keys", "-t", tgt, "Enter"])
-                action_log("type s=%s len=%d session_exists=%s" % (tgt, len(g("t")), tgt in sessions()))
+                subprocess.run([TMUX, "send-keys", "-t", pane(tgt), "Enter"])
+                action_log("type s=%s len=%d" % (tgt, len(g("t"))))
             elif q.path == "/new":
                 dd = g("dir") or HOME
                 nm = g("s") or os.path.basename(dd.rstrip("/")) or "session"
@@ -771,8 +833,8 @@ class H(BaseHTTPRequestHandler):
                 body = r if r else ""
             elif q.path == "/resume" and g("cwd"):
                 body = resume_cwd(g("cwd"))
-            elif q.path == "/kill" and g("s") and g("s") != "control":
-                subprocess.run([TMUX, "kill-session", "-t", g("s")])
+            elif q.path == "/kill" and tgt != "control":
+                subprocess.run([TMUX, "kill-session", "-t", sess_t(tgt)])
             self._s(body, "text/plain; charset=utf-8")
         except (BrokenPipeError, ConnectionResetError):
             pass

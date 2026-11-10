@@ -5,6 +5,7 @@
   <key>ProgramArguments</key><array>
     <string>__TTYD__</string>
     <string>-W</string>
+    <string>-O</string>
     <string>-i</string><string>__TS_IP__</string>
     <string>/usr/bin/env</string><string>-u</string><string>TMUX</string>
     <string>__TMUX__</string><string>new</string>

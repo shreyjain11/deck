@@ -133,5 +133,57 @@ ok(new == os.path.join(bd, "created") and os.path.isdir(new), "make_dir creates 
 ok(srv.make_dir(bd, "../escape") is None and srv.make_dir(bd, "a/b") is None, "make_dir rejects path traversal")
 ok("created" in srv.list_subdirs(bd)["dirs"], "new folder shows up in the browser listing")
 
+print("[request handling: exact targets, no guessing, stale approvals, cross-site]")
+import io
+ok(srv.pane("decktest") == "=decktest:" and srv.sess_t("decktest") == "=decktest",
+   "targets are exact-match (bare names prefix-match a different session)")
+SCREEN = {"work": "Do you want to proceed?\n❯ 1. Yes\nEsc to cancel · Tab to amend\n"}
+def htx(*a):
+    if a[:1] == ("list-sessions",): return "control\n" + "".join(s + "\n" for s in SCREEN)
+    if a[:1] == ("capture-pane",): return SCREEN.get(a[-1].strip("=:"), "")
+    return ""
+srv.tx = htx
+RAN = []
+srv.subprocess.run = lambda argv, *x, **kw: RAN.append(argv)
+srv.action_log = lambda m: None
+def req(method, path, headers=None):
+    h = srv.H.__new__(srv.H)
+    h.path = path; h.command = method; h.request_version = "HTTP/1.1"
+    h.requestline = "%s %s HTTP/1.1" % (method, path); h.client_address = ("t", 0)
+    hd = {"Host": "100.1.2.3:7682"}; hd.update(headers or {})
+    h.headers = hd; h.wfile = io.BytesIO(); h.close_connection = False
+    del RAN[:]
+    (h.do_POST if method == "POST" else h.do_GET)()
+    out = h.wfile.getvalue().decode("utf-8", "replace")
+    return int(out.split(" ", 2)[1]), out, list(RAN)
+keys = lambda ran: [a for a in ran if "send-keys" in a]
+code, out, ran = req("POST", "/type?s=&t=rm%20-rf%20build")
+ok(code == 404 and not keys(ran), "/type with no session is refused, not sent to the control shell")
+code, out, ran = req("POST", "/key?s=decktest&k=Enter")
+ok(code == 404 and not keys(ran), "/key for a closed session is refused (no prefix-match landing)")
+code, out, ran = req("POST", "/type?s=work&t=hi", {"Origin": "http://100.1.2.3:7682",
+                                                   "Sec-Fetch-Site": "same-origin"})
+ok(code == 200 and ["-t", "=work:", "-l", "--", "hi"] == keys(ran)[0][2:],
+   "/type from the panel's own page reaches the exact session")
+code, out, ran = req("POST", "/type?s=work&t=hi", {"Origin": "https://evil.example"})
+ok(code == 403 and not keys(ran), "/type from another site's page is refused")
+code, out, ran = req("POST", "/key?s=work&k=Enter", {"Sec-Fetch-Site": "cross-site"})
+ok(code == 403 and not keys(ran), "cross-site Sec-Fetch-Site is refused")
+code, out, ran = req("GET", "/approve?s=work", {"Sec-Fetch-Site": "none"})
+ok(code == 303 and "Location: /ack?r=approved&s=work" in out and keys(ran)[0][-2:] == ["=work:", "Enter"],
+   "approve from a notification tap presses Enter, then redirects (reload can't re-press)")
+code, out, ran = req("GET", "/deny?s=decktest")
+ok(code == 303 and "r=gone" in out and not keys(ran), "deny for a closed session sends nothing")
+SCREEN["work"] = "some output\n  Working… (esc to interrupt)\n"
+code, out, ran = req("GET", "/deny?s=work")
+ok(code == 303 and "r=stale" in out and not keys(ran),
+   "late Deny while Claude is working sends nothing (Escape would interrupt it)")
+code, out, ran = req("GET", "/approve?s=work", {"Referer": "https://evil.example/page"})
+ok(code == 403 and not keys(ran), "approve linked from another site is refused")
+code, out, ran = req("GET", "/ack?r=stale&s=work")
+ok(code == 200 and "Nothing to answer" in out, "ack page explains a stale tap")
+code, out, ran = req("GET", "/state")
+ok(code == 200 and "Access-Control-Allow-Origin" not in out, "no wildcard CORS (other sites can't read chats)")
+
 print("\n=== python: %d passed, %d failed ===" % (P[0], F[0]))
 sys.exit(1 if F[0] else 0)
